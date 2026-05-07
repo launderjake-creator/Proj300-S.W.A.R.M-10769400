@@ -1,0 +1,368 @@
+clear; clc;
+
+% ================= SERIAL =================
+s = serialport("COM3", 115200); % selected control esp port 
+configureTerminator(s, "LF");
+s.Timeout = 10;
+flush(s);
+
+fprintf('\n╔════════════════════════════════════════════╗\n');
+fprintf('║      PARTICLE FILTER - 4 LANDMARKS         ║\n');
+fprintf('╚════════════════════════════════════════════╝\n\n');
+
+% ===== L-SHAPED ROOM GEOMETRY =====
+INCH = 0.0254; %inches to meters 
+MAIN_WIDTH  = 50 * INCH; %environment geometry.
+MAIN_HEIGHT = 30 * INCH;
+EXT_WIDTH   = 36 * INCH;
+EXT_HEIGHT  = 22 * INCH;
+TOTAL_WIDTH  = MAIN_WIDTH;
+TOTAL_HEIGHT = MAIN_HEIGHT + EXT_HEIGHT;
+
+% ===== FOUR CORNER LANDMARKS =====
+LANDMARKS = [                  % used to measure position from robot 
+    0.0,        0.0;          % L1: Bottom-left corner
+    MAIN_WIDTH, 0.0;          % L2: Bottom-right corner
+    0.0,        TOTAL_HEIGHT; % L3: Top-left corner
+    MAIN_WIDTH, TOTAL_HEIGHT; % L4: Top-right corner
+];
+
+fprintf('Room dimensions: %.2fm × %.2fm (L-shaped)\n', TOTAL_WIDTH, TOTAL_HEIGHT);
+fprintf('4 Landmarks configured:\n');
+fprintf('  L1 (Bottom-Left):  (%.3f, %.3f)\n', LANDMARKS(1,1), LANDMARKS(1,2));
+fprintf('  L2 (Bottom-Right): (%.3f, %.3f)\n', LANDMARKS(2,1), LANDMARKS(2,2));
+fprintf('  L3 (Top-Left):     (%.3f, %.3f)\n', LANDMARKS(3,1), LANDMARKS(3,2));
+fprintf('  L4 (Top-Right):    (%.3f, %.3f)\n\n', LANDMARKS(4,1), LANDMARKS(4,2));
+
+% ===== ROBOT PHYSICAL PARAMETERS =====
+US_OFFSET_X = 0.05;  % sensor is 5cm forward from center.
+US_OFFSET_Y = 0.02;%2 sensor is 2cm left of robot center 
+
+% ===== ASSUMED START POSITION =====  Faces landmark 1
+START_X = 0.25;       % 25cm from left wall
+START_Y = 0.25;       % 25cm from bottom wall
+INIT_SPREAD = 0.15;   % ±15cm initial uncertainty
+
+fprintf('🎯 ASSUMED START POSITION: (%.2f, %.2f) ± %.2fm\n', START_X, START_Y, INIT_SPREAD);
+fprintf('   Place robot near bottom-left corner!\n\n');
+
+% ================= CONFIG =================
+N_MIN = 500;                  %minimum particles 500
+N_MAX = 2000;                 % 2000 particles 
+SENSOR_NOISE_STD = 0.15;      % HC-SR04 real-world noise: 10-20cm
+PROCESS_NOISE    = 0.05;      % Manual pushing = high uncertainty
+HEADING_NOISE_STD = 1.5;      % MPU6050 drift: 1-5°/min accumulates
+RESAMPLE_THRESH_RATIO = 0.5;
+RANDOM_INJECT    = 0.05;      % 5% random injection , worst particles are rempoved and resampled 
+CONVERGENCE_STD  = 0.3;       % Threshhold for convergence , 30cm
+
+% ================= INIT - GAUSSIAN AROUND START POSITION =================
+N = N_MAX; % max 2000
+particles.x = zeros(1, N); %empty array for x 
+particles.y = zeros(1, N); % empty array for y 
+particles.theta = (rand(1,N) - 0.5) * 2 * pi; % completely randomize particle generation at start 
+
+% Initialize particles in Gaussian distribution around start position
+for i = 1:N % each particle is checked to identify if this could be the location
+    valid = false;
+    attempts = 0;
+    while ~valid && attempts < 100 % keeps checking until valid or 100 tries have been attempted, stops infinite loops
+        % Sample from Gaussian distribution
+        x_test = START_X + randn() * INIT_SPREAD; % generates most particles close to the starting postionn
+        y_test = START_Y + randn() * INIT_SPREAD; % 68% of particles are genrated within 15cm of start position.
+        
+        % Check if position is valid (inside room)
+        in_main = (y_test <= MAIN_HEIGHT) && (x_test >= 0) && (x_test <= MAIN_WIDTH) && (y_test >= 0);
+        in_ext  = (y_test > MAIN_HEIGHT) && (y_test <= TOTAL_HEIGHT) && (x_test >= 0) && (x_test <= EXT_WIDTH);
+        valid = in_main || in_ext;
+        
+        attempts = attempts + 1;
+    end
+    
+    % If couldn't find valid position after 100 tries, force it to start position
+    if ~valid
+        x_test = START_X;
+        y_test = START_Y;
+    end
+    
+    particles.x(i) = x_test;%stores valid particles 
+    particles.y(i) = y_test; % stores valid particles 
+end
+% All weights are initialised equally 
+particles.w = ones(1,N) / N;
+
+figure('Position',[100 100 1200 900]);
+trail_est = [];
+prev_heading = [];
+
+fprintf('🚀 FILTER RUNNING - Processing sensor data from COM port\n');
+fprintf('   Using 4 corner landmarks for localization\n');
+fprintf('   Particles initialized around (%.2f, %.2f)\n\n', START_X, START_Y);
+
+consecutiveFailures = 0;
+maxConsecutiveFailures = 50;
+update_count = 0;
+
+while true
+    % ===== READ SENSOR DATA =====
+    if s.NumBytesAvailable > 0 %checks serial port 
+        try
+            line = readline(s); %reads serial data 
+            
+            if isempty(line) || strlength(line) == 0 %skips empty lines
+                pause(0.01);
+                continue;
+            end
+            
+            if startsWith(line, "#")
+                fprintf('%s\n', line);
+                continue;
+            end
+            
+            data = sscanf(line, "%f,%f,%f,%f,%f,%lu"); % extracts the data into 6 part array
+            if length(data) ~= 6
+                continue;
+            end
+            
+            consecutiveFailures = 0;
+            
+            heading = data(1);  %orientation
+            accel_x = data(2);  %acceleration of x
+            accel_y = data(3);  % acceleration of Y 
+            gyro_z  = data(4);  %should be gravity 
+            us_cm   = data(5);  % ultrasonic readings CM 
+            tstamp  = data(6);  % timestamp
+            
+            us_m = us_cm / 100.0; %converts ultrasonic to meters 
+            
+            % DEBUG
+            fprintf('Data: H=%.2f | US=%.1fcm (%.2fm) | t=%lu\n', heading, us_cm, us_m, tstamp);
+            
+            if us_m < 0.02 || us_m > 4.0 % if outisde ultrasonic sensor range then the robot must be outside of the environment.
+                fprintf('  -> REJECTED (out of range)\n');
+                continue;
+            end
+            
+            update_count = update_count + 1;
+
+            % ===== PREDICT =====
+            N_current = length(particles.x); % calculates current numer of particles 
+            particles.x = particles.x + randn(1,N_current)*PROCESS_NOISE; % noise parametrs are introduced
+            particles.y = particles.y + randn(1,N_current)*PROCESS_NOISE;
+            particles.theta = particles.theta + randn(1,N_current)*0.1;%adds noise to orientation 
+
+            in_main = particles.y <= MAIN_HEIGHT; % are particles inside environment
+            in_ext  = (particles.y > MAIN_HEIGHT) & (particles.x <= EXT_WIDTH);
+            valid   = in_main | in_ext;
+            particles.w(~valid) = 0;
+
+            % ===== UPDATE - USE ALL 4 LANDMARKS WITH HEADING WEIGHTING =====
+            sensor_x = particles.x + US_OFFSET_X * cos(particles.theta); % uses robot offset in calcualtions
+            sensor_y = particles.y + US_OFFSET_Y * sin(particles.theta);
+            
+            log_w = log(particles.w + 1e-300);% introduces logs to remover tiny numbers.
+            
+            % Weight each landmark by how well particle is facing it
+            for lm = 1:size(LANDMARKS, 1)
+                landmark_pos = LANDMARKS(lm, :);
+                
+                % Distance from sensor to this landmark
+                pred_dist = sqrt((sensor_x - landmark_pos(1)).^2 + (sensor_y - landmark_pos(2)).^2);
+                
+                % Expected heading to face this landmark
+                expected_heading = atan2(landmark_pos(2) - particles.y, landmark_pos(1) - particles.x);
+                
+                % How well does current heading match this landmark?
+                heading_match = abs(angdiff(particles.theta, expected_heading));
+                
+                % Weight this landmark by how well robot is facing it
+                landmark_weight = exp(-heading_match / HEADING_NOISE_STD);
+                
+                % Distance likelihood weighted by heading match
+                log_w = log_w - 0.5 * landmark_weight .* ((pred_dist - us_m)/SENSOR_NOISE_STD).^2;
+                %large errors reduce weuight and low errors keep weight
+                %high
+            end
+            
+            % Heading constraint
+            if ~isempty(prev_heading) % only applied heading constraints after the first update
+                heading_innov = angdiff(particles.theta, heading); %difference between real data and perticle prediciton
+                log_w = log_w - 0.5 * (heading_innov / HEADING_NOISE_STD).^2; %penalises particles that dont match current heading 
+            end
+            prev_heading = heading; %updates heading 
+            
+            log_w = log_w - max(log_w); %subtracts previous log weight 
+            particles.w = exp(log_w); % converts weight back from logarythms 
+            particles.w = particles.w / sum(particles.w);
+
+            % ===== ADAPTIVE PARTICLE COUNT =====
+            spread = sqrt(var(particles.x) + var(particles.y)); %sum of all particles then sqrt for 2D spread 
+            N_target = round(N_MIN + (N_MAX - N_MIN) * min(spread / 0.5, 1)); % how many particles should there be.
+            
+            n_inject = round(N_current * RANDOM_INJECT); % how many particles should be replaced 
+            [~, worst_idx] = mink(particles.w, n_inject); % find particles with the lowest weights.
+            for i = 1:n_inject%replace wors 100 particles with new ones 
+                valid = false;
+                while ~valid % checks for room contraints 
+                    x_test = rand * TOTAL_WIDTH;
+                    y_test = rand * TOTAL_HEIGHT;
+                    in_main = (y_test <= MAIN_HEIGHT);
+                    in_ext  = (y_test > MAIN_HEIGHT) && (x_test <= EXT_WIDTH);
+                    valid = in_main || in_ext;
+                end
+                idx = worst_idx(i);
+                particles.x(idx) = x_test; %replaces worse particle with new position
+                particles.y(idx) = y_test;
+                particles.theta(idx) = (rand - 0.5) * 2 * pi; %random heading
+                particles.w(idx) = 1/N_current;
+            end
+            particles.w = particles.w / sum(particles.w);
+
+            % ===== RESAMPLE =====
+            Neff = 1/sum(particles.w.^2);
+            if Neff < N_target * RESAMPLE_THRESH_RATIO
+                if N_current < N_target % check if new particles have to be generated.
+                    extra = N_target - N_current;
+                    cum_w = cumsum(particles.w); % cumaliative sum of weights 
+                    idx_extra = zeros(1, extra);
+                    for k = 1:extra
+                        r = rand();
+                        idx_extra(k) = find(cum_w >= r, 1, 'first');
+                    end
+                    particles.x = [particles.x, particles.x(idx_extra) + randn(1,extra)*0.02];%duplicate selected particles based on weight 
+                    particles.y = [particles.y, particles.y(idx_extra) + randn(1,extra)*0.02];
+                    particles.theta = [particles.theta, particles.theta(idx_extra) + randn(1,extra)*0.05]; %random heading 
+                    particles.w = ones(1, N_target) / N_target;
+                elseif N_current > N_target
+                    particles = systematic_resample(particles, N_target);
+                else
+                    particles = systematic_resample(particles, N_target);
+                end
+            end
+
+            % ===== ESTIMATE =====
+            spread = sqrt(var(particles.x) + var(particles.y));% varience , average distance from mean 
+            converged = spread < CONVERGENCE_STD; %uses convergence threshhold to identify if the filter is converged.
+            
+            if converged
+                est_x = sum(particles.x .* particles.w); %weighted average of all positions
+                est_y = sum(particles.y .* particles.w);
+                est_theta = atan2(sum(sin(particles.theta).*particles.w), ... %average of heading
+                                  sum(cos(particles.theta).*particles.w));
+            else
+                [est_x, est_y] = densest_cluster(particles); %finds where most particles are clustered.
+                est_theta = heading;
+            end
+
+            % ===== PLOT =====
+            trail_est(end+1,:) = [est_x, est_y];
+
+            clf; hold on;
+            
+            % Room outline
+            rectangle('Position',[0, 0, MAIN_WIDTH, MAIN_HEIGHT], ...
+                      'EdgeColor','k', 'LineWidth', 2.5);
+            rectangle('Position',[0, MAIN_HEIGHT, EXT_WIDTH, EXT_HEIGHT], ...
+                      'EdgeColor','k', 'LineWidth', 2.5);
+            patch([EXT_WIDTH, MAIN_WIDTH, MAIN_WIDTH, EXT_WIDTH], ...
+                  [MAIN_HEIGHT, MAIN_HEIGHT, TOTAL_HEIGHT, TOTAL_HEIGHT], ...
+                  [0.9 0.9 0.9], 'EdgeColor','none', 'FaceAlpha',0.3);
+            
+            % Particles
+            scatter(particles.x, particles.y, 8, 'b', 'filled', 'MarkerFaceAlpha', 0.3);
+            
+            % Trail
+            if size(trail_est,1)>1
+                plot(trail_est(:,1), trail_est(:,2), 'r-', 'LineWidth', 2);
+            end
+            
+            % Current estimate
+            scatter(est_x, est_y, 200, 'r', 'filled', 'MarkerEdgeColor','k', 'LineWidth', 2);
+            % FIXED: Negate only for display
+            quiver(est_x, est_y, 0.15*cos(-est_theta), 0.15*sin(-est_theta), ...
+                   0, 'r', 'LineWidth', 3, 'MaxHeadSize', 1.5);
+            
+            % All 4 landmarks
+            for lm = 1:4
+                scatter(LANDMARKS(lm,1), LANDMARKS(lm,2), 300, 'k', 's', 'filled', 'LineWidth', 2);
+                text(LANDMARKS(lm,1)+0.05, LANDMARKS(lm,2)+0.05, sprintf('L%d', lm), ...
+                     'FontSize', 10, 'FontWeight', 'bold', 'Color', 'k');
+            end
+            
+            % Mark assumed start position
+            scatter(START_X, START_Y, 150, 'g', 'x', 'LineWidth', 3);
+            text(START_X+0.05, START_Y-0.05, 'START', ...
+                 'FontSize', 9, 'FontWeight', 'bold', 'Color', 'g');
+
+            xlim([-0.05 TOTAL_WIDTH+0.05]); 
+            ylim([-0.05 TOTAL_HEIGHT+0.05]); 
+            grid on; axis equal;
+            
+            N_current = length(particles.x);
+            status = "CONVERGED"; if ~converged, status = "searching..."; end
+            
+            title(sprintf('4-Landmark Particle Filter | %s | Updates: %d | N=%d | Spread: %.3fm', ...
+                          status, update_count, N_current, spread));
+            xlabel('x (m)'); 
+            ylabel('y (m)');
+            
+            % Display estimate in corner - FIXED: Negate only for display
+            text(0.02, TOTAL_HEIGHT-0.05, ...
+                 sprintf('Est: (%.3f, %.3f) | θ=%.2f° | US=%.2fm', est_x, est_y, rad2deg(-est_theta), us_m), ...
+                 'FontSize', 9, 'BackgroundColor', [1 1 1 0.8], 'EdgeColor', 'k');
+            
+            drawnow limitrate;
+            
+        catch ME
+            fprintf('Parse error: %s\n', ME.message);
+        end
+    else
+        consecutiveFailures = consecutiveFailures + 1;
+        
+        if consecutiveFailures > maxConsecutiveFailures
+            fprintf('\n⚠️  WARNING: No sensor data for 5 seconds!\n');
+            fprintf('   Check ESP connections\n');
+            consecutiveFailures = 0;
+        end
+        
+        pause(0.1);
+    end
+end
+
+% ===== HELPERS =====
+function delta = angdiff(a, b)
+    delta = mod(a - b + pi, 2*pi) - pi;
+end
+
+function [mx, my] = densest_cluster(particles)
+    nbins = 20;
+    edges_x = linspace(min(particles.x), max(particles.x), nbins+1);
+    edges_y = linspace(min(particles.y), max(particles.y), nbins+1);
+    H = histcounts2(particles.x, particles.y, edges_x, edges_y);
+    [~, idx] = max(H(:));
+    [ix, iy] = ind2sub(size(H), idx);
+    in_bin = particles.x >= edges_x(ix) & particles.x < edges_x(ix+1) & ...
+             particles.y >= edges_y(iy) & particles.y < edges_y(iy+1);
+    if any(in_bin)
+        mx = mean(particles.x(in_bin));
+        my = mean(particles.y(in_bin));
+    else
+        mx = (edges_x(ix)+edges_x(ix+1))/2;
+        my = (edges_y(iy)+edges_y(iy+1))/2;
+    end
+end
+
+function particles = systematic_resample(particles, N)
+    positions = ((0:N-1) + rand) / N;
+    cum_w = cumsum(particles.w);
+    indices = zeros(1,N);
+    i=1; j=1;
+    while i <= N
+        if positions(i) < cum_w(j), indices(i)=j; i=i+1;
+        else, j=j+1; end
+    end
+    particles.x = particles.x(indices) + randn(1,N) * 0.01;
+    particles.y = particles.y(indices) + randn(1,N) * 0.01;
+    particles.theta = particles.theta(indices) + randn(1,N) * 0.02;
+    particles.w = ones(1,N) / N;
+end
